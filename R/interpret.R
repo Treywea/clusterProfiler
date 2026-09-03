@@ -1024,9 +1024,17 @@ interpret_hierarchical <- function(x_minor,
 
   debug <- isTRUE(getOption("aisdk.debug", FALSE))
 
+  # `model` may be a character id OR an aisdk LanguageModelV1, which is an ENVIRONMENT. Pasting an
+  # environment into a message raises "cannot coerce type 'environment' to vector of type
+  # 'character'". Every place this function names the model in human-readable text must therefore
+  # go through .model_label(), never through `model` directly. The two sites in the FAILURE
+  # branches below are the ones that mattered: they turned every failed call into a bogus
+  # input-contract error and destroyed the real diagnosis with it.
+  model_label <- .model_label(model)
+
   if (debug) {
     message(
-      "[DEBUG] .call_generate_object: model=", model,
+      "[DEBUG] .call_generate_object: model=", model_label,
       " task=", task, " cluster=", cluster_id, " max_tokens=", max_tokens
     )
   }
@@ -1073,7 +1081,7 @@ interpret_hierarchical <- function(x_minor,
 
         warn_parts <- c(
           paste0("generate_object() returned NULL for cluster '", cluster_id, "'."),
-          "i" = paste0("Model: ", model),
+          "i" = paste0("Model: ", model_label),
           "i" = paste0("finish_reason: ", finish),
           "i" = paste0(
             "raw_text (", nchar(raw), " chars): ",
@@ -1097,7 +1105,7 @@ interpret_hierarchical <- function(x_minor,
     error = function(e) {
       rlang::warn(c(
         paste0("LLM call failed for cluster '", cluster_id, "': ", e$message),
-        "i" = paste0("Model: ", model),
+        "i" = paste0("Model: ", model_label),
         "i" = "Tip: Re-run with verbose=TRUE for full debug output"
       ))
       res <- list(
@@ -1133,6 +1141,22 @@ interpret_hierarchical <- function(x_minor,
     "Functional Modules: ", modules, "\n",
     "Network Evidence: ", evidence
   )
+}
+
+#' A printable name for `model`, which may be a character id or an aisdk model object.
+#'
+#' The object's field names are not a stable public contract, so they are probed defensively;
+#' anything unrecognised becomes a placeholder rather than an error.
+#' @keywords internal
+#' @noRd
+.model_label <- function(model) {
+  if (is.character(model) && length(model) == 1L && !is.na(model)) return(model)
+  for (f in list(function() model$modelId, function() model$model_id,
+                 function() model$model, function() attr(model, "modelId"))) {
+    v <- tryCatch(f(), error = function(e) NULL)
+    if (is.character(v) && length(v) == 1L && !is.na(v) && nzchar(v)) return(v)
+  }
+  "<unnamed model object>"
 }
 
 .postprocess_network <- function(res) {
