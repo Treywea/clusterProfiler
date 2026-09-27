@@ -248,13 +248,16 @@ process_enrichment_input <- function(x, n_pathways) {
     utils::head(df, n)
   }
 
+  # The input gene slots hold the IDs the enrichment was run on (often ENTREZID), while the
+  # term table of a readable object holds symbols. Return symbols so the marker list the
+  # model reads is gene names rather than bare numeric IDs.
   get_genes <- function(obj, cluster = NULL) {
     if (inherits(obj, "enrichResult")) {
-      return(obj@gene)
+      return(.ids_to_symbols(obj@gene, obj))
     } else if (inherits(obj, "compareClusterResult")) {
       if (!is.null(cluster) && !is.null(obj@geneClusters)) {
         if (cluster %in% names(obj@geneClusters)) {
-          return(obj@geneClusters[[cluster]])
+          return(.ids_to_symbols(obj@geneClusters[[cluster]], obj))
         }
       }
     }
@@ -461,6 +464,16 @@ process_enrichment_input <- function(x, n_pathways) {
 #'   Some models (especially reasoning models) may need much higher values
 #'   (e.g., 16384 or more) to produce complete structured output.
 #' @param temperature Sampling temperature. Default 0.3.
+#' @param reduce_go Logical, whether to apply semantic-similarity GO term redundancy
+#'   reduction before interpretation. Only applies to GO enrichment results.
+#'   Default FALSE.
+#' @param go_reduction_threshold Semantic similarity threshold (0-1).
+#'   Higher values = more aggressive reduction. Default 0.7.
+#' @param reasoning Optional reasoning/thinking configuration passed through to the
+#'   provider, e.g. \code{list(type = "enabled", budget_tokens = 4096)}. Left \code{NULL}
+#'   the request is byte-identical to one made before this argument existed. Whatever is
+#'   passed is recorded in the execution stamp as \code{reasoning_requested}, alongside
+#'   \code{reasoning_evidence} -- whether the response actually carried a reasoning block.
 #' @param verbose Logical, whether to print debug messages showing raw API
 #'   responses, token usage, and JSON parsing details. Default FALSE.
 #'   Equivalent to setting `options(aisdk.debug = TRUE)` for the call.
@@ -483,6 +496,9 @@ process_enrichment_input <- function(x, n_pathways) {
 #'   model = "deepseek:deepseek-chat",
 #'   context = "Cancer proliferation study"
 #' )
+#' # With GO redundancy reduction
+#' ego <- enrichGO(gene = genes, OrgDb = org.Mm.eg.db, ont = "BP")
+#' res <- interpret(ego, reduce_go = TRUE, go_reduction_threshold = 0.7)
 #' # Reuse aisdk's global default model
 #' # aisdk::set_model("openai:gpt-4o-mini")
 #' # res <- interpret(df, context = "Cancer proliferation study")
@@ -498,6 +514,9 @@ interpret <- function(x,
                       gene_fold_change = NULL,
                       max_tokens = 8192,
                       temperature = 0.3,
+                      reduce_go = FALSE,
+                      go_reduction_threshold = 0.7,
+                      reasoning = NULL,
                       verbose = FALSE) {
   if (missing(x)) rlang::abort("Enrichment result 'x' is required.")
 
@@ -507,15 +526,36 @@ interpret <- function(x,
     on.exit(options(aisdk.debug = old_debug), add = TRUE)
   }
 
+  # Apply rrvgo reduction if requested and input is enrichResult
+  if (isTRUE(reduce_go) && is(x, "enrichResult")) {
+    x <- reduce_go_redundancy(x, threshold = go_reduction_threshold)
+    if (isTRUE(attr(x, "rrvgo_reduced"))) {
+      message(sprintf(
+        "Applied rrvgo reduction: %d -> %d GO terms (%.1f%% reduction)",
+        attr(x, "rrvgo_original_n"),
+        attr(x, "rrvgo_reduced_n"),
+        100 * (attr(x, "rrvgo_original_n") - attr(x, "rrvgo_reduced_n")) / attr(x, "rrvgo_original_n")
+      ))
+    }
+  }
+
   model <- .normalize_interpret_model(model)
   res_list <- process_enrichment_input(x, n_pathways)
+  gene_fold_change <- .fc_to_symbols(gene_fold_change, x)
+
+  .prov <- .prov_new()
 
   if (length(res_list) == 0) {
-    return(structure(
-      list(overview = "No significant pathways found to interpret.", confidence = "None"),
-      class = c("interpretation", "list")
+    return(.attach_provenance(
+      structure(
+        list(overview = "No significant pathways found to interpret.", confidence = "None"),
+        class = c("interpretation", "list")
+      ),
+      .prov_finalize(.prov, "interpret", NA_character_)
     ))
   }
+
+  .ev_sha <- .evidence_digest_all(x, res_list)
 
   results <- lapply(names(res_list), function(name) {
     message(sprintf("Interpreting cluster: %s", name))
@@ -556,7 +596,10 @@ interpret <- function(x,
       user_prompt = user_prompt,
       has_prior = !is.null(current_prior),
       max_tokens = max_tokens,
-      temperature = temperature
+      temperature = temperature,
+      reasoning = reasoning,
+      collector = .prov,
+      stage = paste0("interpret:", name)
     )
 
     res$cluster <- name
@@ -564,25 +607,75 @@ interpret <- function(x,
   })
 
   names(results) <- names(res_list)
+  .p <- .prov_finalize(.prov, "interpret", .ev_sha)
 
   if (length(results) == 1 && names(results)[1] == "Default") {
-    return(results[[1]])
+    return(.attach_provenance(results[[1]], .p))
   }
   class(results) <- c("interpretation_list", "list")
-  results
+  .attach_provenance(results, .p)
 }
 
 # ============================================================================
 # Core: interpret_agent()
 # ============================================================================
 
+## Agent 4 (Reviewer): schema + system prompt, used by interpret_agent() when review = TRUE.
+## Internal helpers (not exported); audits the synthesized draft for grounding,
+## overclaiming, and experimental-label fidelity.
+.reviewer_schema <- function() {
+  z_object(
+    verdict = z_string("'pass' if every claim is grounded; 'revise' if any unsupported, overclaimed, or mislabeled claim exists"),
+    grounding_score = z_string("High / Medium / Low: how well the draft's claims are supported by the provided evidence"),
+    issues = z_array(
+      z_object(
+        claim = z_string("the specific problematic statement, quoted from the draft"),
+        problem = z_string("why it is unsupported, overclaimed, or mislabeled"),
+        severity = z_string("high / medium / low")
+      ),
+      description = "Grounding problems found; empty array if none"
+    ),
+    evidence_sufficiency = z_enum(
+      c("sufficient", "partial", "insufficient"),
+      description = "Whether the supplied evidence classes can support a claim at the resolution the draft asserts. 'insufficient' when the draft names a specific entity that the evidence cannot single out."
+    ),
+    supported_resolution = z_string(
+      "The finest level of claim the evidence actually supports, stated plainly (e.g. 'pathway/module level: oxidative phosphorylation is perturbed' rather than 'gene level: ATP5F1C was knocked down'). Use the draft's own domain vocabulary."
+    ),
+    abstain_recommended = z_enum(
+      c("no", "yes"),
+      description = "'yes' if the specific attribution should be withheld entirely and only the supported-resolution statement reported. Independent of grounding_score: a draft can cite only real genes and still over-resolve."
+    ),
+    corrected_overview = z_string("Overview rewritten to remove unsupported claims, fix any mislabeled experimental groups or contrast direction, and downgrade any claim that exceeds supported_resolution to that resolution; if nothing needs fixing, faithfully restate the original"),
+    adjusted_confidence = z_string("High / Medium / Low after audit"),
+    warnings = z_array(z_string(), description = "Caveats a reader must be told")
+  )
+}
+
+.reviewer_system_prompt <- function() {
+  paste0(
+    "You are 'Agent Reviewer', a skeptical bioinformatics auditor. You did NOT run the analysis; ",
+    "your only job is to verify the DRAFT interpretation against the PROVIDED EVIDENCE.\n",
+    "Rules:\n",
+    "1. GROUNDING: every mechanism, driver, cell-type or phenotype claim must trace to an enriched pathway or gene present in the evidence. Flag any pathway or gene cited that is NOT in the evidence. Distinguish an explicitly-labelled *inferred* regulator (allowed if marked as an inference) from a gene falsely presented as observed in the data (a hallucination).\n",
+    "2. CONTRAST / LABEL FIDELITY: the draft must describe the experimental groups exactly as the context states. If the context's contrast is 'A_vs_B', the draft must NOT silently relabel it (e.g. calling a susceptible-vs-control contrast 'resilient vs non-resilient').\n",
+    "3. OVERCLAIMING: flag correlation-as-causation, claims of 'discovered/proven' mechanism, or phenotype attribution unsupported by enrichment.\n",
+    "4. EVIDENCE SUFFICIENCY (resolution): judge whether the evidence CLASSES supplied can support a claim as specific as the draft makes, and set evidence_sufficiency, supported_resolution and abstain_recommended accordingly. This is separate from grounding: a draft may cite only genes that are present and still resolve far beyond what the evidence can single out. Guidance: enrichment of a shared process (e.g. many members of one complex or pathway) supports a claim at PATHWAY/COMPLEX level, but does not single out WHICH member was perturbed; without directionality, upstream-regulator or TF enrichment, or interaction evidence, a named single-gene cause is not supported. Naming a gene while separately declaring low confidence does NOT resolve this -- if the evidence cannot support the attribution, set abstain_recommended = 'yes' and state the supported claim instead. Do not manufacture doubt either: when the evidence does single out the entity, say sufficient.\n",
+    "5. Do NOT introduce new biology, genes, or pathways. Only audit and, where needed, soften, downgrade in resolution, or correct.\n",
+    "Return verdict, grounding_score, evidence_sufficiency, supported_resolution, abstain_recommended, issues, a corrected_overview, adjusted_confidence, and reader warnings."
+  )
+}
+
 #' Interpret enrichment results using a multi-agent pipeline (Deep Mode)
 #'
-#' Employs three specialized AI agents in sequence for rigorous interpretation:
+#' Employs specialized AI agents in sequence for rigorous interpretation:
 #' \enumerate{
 #'   \item Agent Cleaner: Filters noise and selects relevant pathways.
 #'   \item Agent Detective: Identifies key regulators and functional modules.
 #'   \item Agent Synthesizer: Produces a coherent biological narrative.
+#'   \item Agent Reviewer (optional, \code{review = TRUE}): Audits the draft for
+#'     grounding, overclaiming, and experimental-label fidelity; flags issues and
+#'     returns a corrected overview.
 #' }
 #'
 #' Uses aisdk's Agent and Session system for shared context across agents.
@@ -598,10 +691,45 @@ interpret <- function(x,
 #' @param gene_fold_change Named numeric vector of log fold changes.
 #' @param max_tokens Maximum tokens per agent call. Default 8192.
 #' @param temperature Sampling temperature. Default 0.3.
+#' @param review Logical, whether to run a final Reviewer agent (Agent 4) that
+#'   audits the synthesized draft against the input evidence for grounding,
+#'   overclaiming, experimental-label fidelity, and **evidence sufficiency**
+#'   (whether the supplied evidence classes can support a claim as specific as
+#'   the draft makes). When `TRUE`, the result gains a `review` field
+#'   (verdict, grounding_score, evidence_sufficiency, supported_resolution,
+#'   abstain_recommended, issues, adjusted_confidence, warnings) and
+#'   `overview_original`; if the verdict is `"revise"`, `overview` is replaced
+#'   by the corrected version, in which claims exceeding `supported_resolution`
+#'   are downgraded to that resolution. Default `FALSE`, which reproduces the released
+#'   three-agent behavior exactly: the audit is an addition a caller opts into,
+#'   and leaving it off keeps existing scripts measuring what they measured
+#'   before. Note that the audit roughly doubles wall-clock time per unit and
+#'   adds one model call, and that it is not infallible -- on objects where the
+#'   Synthesizer returned nothing it has been observed to return `pass` with a
+#'   `High` grounding score.
+#' @param reduce_go Logical. Run [reduce_go_redundancy()] on the object before
+#'   building any prompt. Deterministic, GO-only, and makes no model call; a
+#'   no-op on non-GO results. Default `FALSE`.
+#' @param go_reduction_threshold Wang semantic-similarity threshold passed to
+#'   [reduce_go_redundancy()] when `reduce_go = TRUE`. Default 0.7; 0.5 is the
+#'   stricter setting for lists above ~400 terms.
+#' @param reasoning Optional reasoning/thinking configuration passed through to the
+#'   provider, e.g. `list(type = "enabled", budget_tokens = 4096)`. Left `NULL` the
+#'   request is byte-identical to one made before this argument existed. Whatever is
+#'   passed is recorded in the execution stamp as `reasoning_requested`, alongside
+#'   `reasoning_evidence` -- whether the response actually carried a reasoning block.
+#'   The two are separate because a gateway can accept the parameter and drop it, and
+#'   the caller can only observe the second.
 #' @param verbose Logical, whether to print debug messages. Default FALSE.
 #' @return An `interpretation` object with deep analysis fields plus
 #'   regulatory_drivers, refined_network, and network_evidence from the
-#'   detective agent.
+#'   detective agent. When `review = TRUE`, also includes `review` and
+#'   `overview_original`. The `review` field reports grounding separately from
+#'   resolution: `abstain_recommended = "yes"` flags a draft whose cited
+#'   evidence is real but which resolves to a more specific entity than that
+#'   evidence can single out, with `supported_resolution` giving the claim the
+#'   evidence does support.
+#' @md
 #' @export
 #' @examples
 #' \dontrun{
@@ -619,6 +747,10 @@ interpret_agent <- function(x,
                             gene_fold_change = NULL,
                             max_tokens = 8192,
                             temperature = 0.3,
+                            review = FALSE,
+                            reduce_go = FALSE,
+                            go_reduction_threshold = 0.7,
+                            reasoning = NULL,
                             verbose = FALSE) {
   if (missing(x)) rlang::abort("Enrichment result 'x' is required.")
 
@@ -628,15 +760,38 @@ interpret_agent <- function(x,
     on.exit(options(aisdk.debug = old_debug), add = TRUE)
   }
 
+  # Same deterministic reduction stage interpret() runs, on the same terms: before any model
+  # call, GO-only, and a no-op on anything else. Kept as an explicit opt-in rather than a
+  # default so that existing agent scripts keep measuring what they measured before.
+  if (isTRUE(reduce_go) && is(x, "enrichResult")) {
+    x <- reduce_go_redundancy(x, threshold = go_reduction_threshold)
+    if (isTRUE(attr(x, "rrvgo_reduced"))) {
+      message(sprintf(
+        "Applied GO redundancy reduction: %d -> %d GO terms (%.1f%% reduction)",
+        attr(x, "rrvgo_original_n"),
+        attr(x, "rrvgo_reduced_n"),
+        100 * (attr(x, "rrvgo_original_n") - attr(x, "rrvgo_reduced_n")) / attr(x, "rrvgo_original_n")
+      ))
+    }
+  }
+
   model <- .normalize_interpret_model(model)
   res_list <- process_enrichment_input(x, n_pathways)
+  gene_fold_change <- .fc_to_symbols(gene_fold_change, x)
+
+  .prov <- .prov_new()
 
   if (length(res_list) == 0) {
-    return(structure(
-      list(overview = "No significant pathways found to interpret."),
-      class = c("interpretation", "list")
+    return(.attach_provenance(
+      structure(
+        list(overview = "No significant pathways found to interpret."),
+        class = c("interpretation", "list")
+      ),
+      .prov_finalize(.prov, "interpret_agent", NA_character_)
     ))
   }
+
+  .ev_sha <- .evidence_digest_all(x, res_list)
 
   results <- lapply(names(res_list), function(name) {
     item <- res_list[[name]]
@@ -691,12 +846,23 @@ interpret_agent <- function(x,
 
       cleaner_res <- tryCatch(
         {
-          gen <- generate_object(
+          gen <- .gen_object_stamped(
+            reasoning = reasoning,
+            collector = .prov, stage = "cleaner",
             model = model, prompt = cleaner_prompt,
             schema = .cleaner_schema(), schema_name = "cleaner_result",
             system = cleaner$system_prompt,
             temperature = temperature, max_tokens = max_tokens
           )
+          # A 200 that does not parse is a failure, not a result. generate_object() raises no
+          # condition in that case, so a bare `gen$object` hands NULL to the caller; every
+          # downstream is.list()/!is.null() guard then skips silently, and for the synthesizer
+          # the NULL reaches .postprocess_network(), where `class(res) <-` on NULL aborts the
+          # whole run with "attempt to set an attribute on NULL" (observed 2026-08-27, both
+          # review = TRUE arms of the A1 public-case ablation). Raising here routes the failure
+          # to the handler below, which warns and -- for the synthesizer -- returns a marked
+          # placeholder, so the call is reported rather than fatal.
+          .stop_if_unparsed(gen, "Cleaner")
           gen$object
         },
         error = function(e) {
@@ -742,12 +908,15 @@ interpret_agent <- function(x,
 
     detective_res <- tryCatch(
       {
-        gen <- generate_object(
+        gen <- .gen_object_stamped(
+          reasoning = reasoning,
+          collector = .prov, stage = "detective",
           model = model, prompt = detective_prompt,
           schema = .detective_schema(), schema_name = "detective_result",
           system = detective$system_prompt,
           temperature = temperature, max_tokens = max_tokens
         )
+        .stop_if_unparsed(gen, "Detective")
         gen$object
       },
       error = function(e) {
@@ -784,12 +953,15 @@ interpret_agent <- function(x,
 
     final_res <- tryCatch(
       {
-        gen <- generate_object(
+        gen <- .gen_object_stamped(
+          reasoning = reasoning,
+          collector = .prov, stage = "synthesizer",
           model = model, prompt = synthesizer_prompt,
           schema = .interpretation_schema(), schema_name = "synthesis_result",
           system = synth_system,
           temperature = temperature, max_tokens = max_tokens
         )
+        .stop_if_unparsed(gen, "Synthesizer")
         gen$object
       },
       error = function(e) {
@@ -808,17 +980,88 @@ interpret_agent <- function(x,
       }
     }
 
+    ## Agent 4: The Reviewer -- audit the draft for grounding, overclaiming, label fidelity,
+    ## and whether the evidence class present can support the resolution the draft claims.
+    if (isTRUE(review) && is.list(final_res) && !is.null(final_res$overview)) {
+      message(sprintf("Processing cluster '%s' with Agent 4: The Reviewer...", name))
+      ## Evidence inventory: state which evidence classes are present and which are ABSENT.
+      ## Without this the Reviewer cannot judge sufficiency -- it sees what was given but has no
+      ## way to know what was withheld, so it audits only what is in front of it and lets a
+      ## single-gene attribution built on term-level evidence pass.
+      evidence_inventory <- paste0(
+        "EVIDENCE INVENTORY (what the analysts did and did NOT have)\n",
+        "- Enriched term table with member genes: PRESENT\n",
+        "- Experimental context: ", if (!is.null(context) && nzchar(context)) "PRESENT" else "ABSENT", "\n",
+        "- Gene-level directionality (log fold change): ",
+        if (!is.null(fc_text)) "PRESENT" else "ABSENT (no up/down direction available)", "\n",
+        "- Protein-protein interaction network: ",
+        if (!is.null(ppi_text)) "PRESENT" else "ABSENT (no physical-interaction evidence)", "\n",
+        "- Inferred-driver report from the Detective agent: ",
+        if (!is.null(detective_text) && nzchar(detective_text))
+          "PRESENT (these are INFERENCES, not observations)" else "ABSENT", "\n",
+        "- Upstream regulator / TF enrichment, ChIP or perturbation evidence: ",
+        "ABSENT unless it appears in the term table above\n\n"
+      )
+      reviewer_prompt <- paste0(
+        "EVIDENCE GIVEN TO THE ANALYSTS\n",
+        if (!is.null(context)) paste0("Experimental context: ", context, "\n\n") else "",
+        "Enriched pathways (name and member genes):\n", cleaned_pathways, "\n\n",
+        if (!is.null(detective_text) && nzchar(detective_text))
+          paste0("Detective's report (inferred drivers/modules):\n", detective_text, "\n\n") else "",
+        evidence_inventory,
+        "DRAFT INTERPRETATION TO AUDIT\n",
+        "Overview: ", final_res$overview %||% "", "\n",
+        "Key mechanisms: ", final_res$key_mechanisms %||% "", "\n",
+        "Hypothesis: ", final_res$hypothesis %||% "", "\n",
+        "Narrative: ", final_res$narrative %||% "", "\n",
+        "Regulatory drivers: ", paste(unlist(final_res$regulatory_drivers), collapse = ", "), "\n\n",
+        "Audit the draft strictly against the evidence, and judge separately whether the ",
+        "evidence classes listed in the inventory can support the resolution the draft claims. ",
+        "A draft that states LOW confidence and then asserts a specific attribution anyway is ",
+        "exactly the case rule 4 exists to catch: report it, set the resolution the evidence ",
+        "does support, and rewrite the overview at that resolution."
+      )
+      review_res <- tryCatch(
+        {
+          gen <- .gen_object_stamped(
+            reasoning = reasoning,
+            collector = .prov, stage = "reviewer",
+            model = model, prompt = reviewer_prompt,
+            schema = .reviewer_schema(), schema_name = "reviewer_result",
+            system = .reviewer_system_prompt(),
+            temperature = temperature, max_tokens = max_tokens
+          )
+          .stop_if_unparsed(gen, "Reviewer")
+          gen$object
+        },
+        error = function(e) {
+          rlang::warn(paste0("Agent Reviewer failed: ", e$message))
+          NULL
+        }
+      )
+      if (!is.null(review_res)) {
+        final_res$overview_original <- final_res$overview
+        final_res$review <- review_res
+        if (!is.null(review_res$verdict) && tolower(review_res$verdict) == "revise" &&
+            !is.null(review_res$corrected_overview) && nzchar(review_res$corrected_overview)) {
+          final_res$overview <- review_res$corrected_overview
+        }
+      }
+    }
+
     .postprocess_network(final_res)
   })
 
   results <- Filter(Negate(is.null), results)
   names(results) <- vapply(results, function(r) r$cluster %||% "Unknown", character(1))
+  .p <- .prov_finalize(.prov, "interpret_agent", .ev_sha,
+                       extra = list(review_enabled = isTRUE(review)))
 
   if (length(results) == 1 && names(results)[1] == "Default") {
-    return(results[[1]])
+    return(.attach_provenance(results[[1]], .p))
   }
   class(results) <- c("interpretation_list", "list")
-  results
+  .attach_provenance(results, .p)
 }
 
 # ============================================================================
@@ -944,6 +1187,27 @@ interpret_hierarchical <- function(x_minor,
   )
 }
 
+# Map input gene IDs to symbols using the object's own gene2Symbol table (filled by
+# setReadable / readable = TRUE). IDs without a mapping are kept unchanged, so objects that
+# were never made readable, or were built on symbols, pass through untouched.
+.ids_to_symbols <- function(ids, obj) {
+  if (length(ids) == 0) return(ids)
+  map <- tryCatch(obj@gene2Symbol, error = function(e) NULL)
+  if (length(map) == 0 || is.null(names(map))) return(ids)
+  sym <- unname(map[as.character(ids)])
+  ifelse(is.na(sym) | !nzchar(sym), ids, sym)
+}
+
+# gene_fold_change is documented as keyed by the IDs used in the enrichment; rename it to
+# symbols with the same table so it can be matched against the symbol-keyed term table.
+.fc_to_symbols <- function(gene_fold_change, obj) {
+  if (is.null(gene_fold_change) || is.null(names(gene_fold_change))) return(gene_fold_change)
+  if (!inherits(obj, c("enrichResult", "compareClusterResult", "gseaResult"))) return(gene_fold_change)
+  new <- .ids_to_symbols(names(gene_fold_change), obj)
+  out <- gene_fold_change; names(out) <- new
+  out[!duplicated(names(out))]
+}
+
 .get_top_genes_text <- function(genes, gene_fold_change) {
   if (is.null(genes) || length(genes) == 0) {
     return(NULL)
@@ -1005,9 +1269,431 @@ interpret_hierarchical <- function(x_minor,
   paste(names(top_fc), round(top_fc, 2), sep = ":", collapse = ", ")
 }
 
+# ============================================================================
+# Execution provenance
+# ============================================================================
+#
+# Why this exists. A remote model is not a versionable artifact the way a Bioconductor
+# dependency is: the string "gpt-5.5" names whatever the gateway serves today. Two failures
+# in this project made the consequence concrete. (1) A decoding parameter the caller set was
+# silently dropped before reaching the model, and nothing in the returned object would have
+# revealed it. (2) A batch of runs recorded an HTTP 401 error string as though it were the
+# interpretation, because the call raised no condition the caller could catch and the result
+# object carried no status. Both are invisible to an analyst holding only the result.
+#
+# The stamp below closes that gap: every model call in this module records what was asked
+# for, what came back, and what evidence it was asked about, hashed so that a claim can be
+# tied to the exact input that licensed it.
+
+#' @keywords internal
+.sha256 <- function(x) {
+  if (is.null(x)) return(NA_character_)
+  s <- paste(as.character(x), collapse = "\n")
+  if (requireNamespace("digest", quietly = TRUE)) {
+    return(digest::digest(s, algo = "sha256", serialize = FALSE))
+  }
+  NA_character_
+}
+
+#' @keywords internal
+.model_identity <- function(model) {
+  out <- list(model_id = NA_character_, provider = NA_character_, endpoint = NA_character_)
+  if (is.null(model)) return(out)
+  if (is.character(model) && length(model) == 1L) {
+    out$model_id <- model
+    parts <- strsplit(model, ":", fixed = TRUE)[[1]]
+    if (length(parts) > 1L) {
+      out$provider <- parts[1]
+      out$model_id <- paste(parts[-1], collapse = ":")
+    }
+    return(out)
+  }
+  # aisdk LanguageModelV1 (or a custom provider's model object): introspect defensively,
+  # since the field names are not part of a stable public contract.
+  grab <- function(...) {
+    for (f in list(...)) {
+      v <- tryCatch(f(), error = function(e) NULL)
+      if (!is.null(v) && is.character(v) && length(v) == 1L && nzchar(v)) return(v)
+    }
+    NA_character_
+  }
+  out$model_id <- grab(function() model$modelId, function() model$model_id,
+                       function() model$model, function() attr(model, "modelId"))
+  out$provider <- grab(function() model$provider, function() model$providerName,
+                       function() model$provider_name, function() attr(model, "provider"))
+  url <- grab(function() model$config$baseURL, function() model$config$base_url,
+              function() model$baseURL, function() model$base_url)
+  if (!is.na(url)) {
+    # host only: the full URL can carry a key in a query string
+    out$endpoint <- sub("^([a-z]+://[^/]+).*$", "\\1", url)
+  }
+  out
+}
+
+#' @keywords internal
+.evidence_digest <- function(x, df = NULL, genes = NULL) {
+  # The evidence set is what makes grounding a set-membership test rather than an opinion.
+  # Hashing it lets a reader prove that a given interpretation was produced from a given
+  # enrichment table, and detect the case where the object was edited in between.
+  bits <- character(0)
+  if (!is.null(df) && is.data.frame(df) && nrow(df) > 0) {
+    for (col in c("ID", "Description", "p.adjust", "geneID", "core_enrichment")) {
+      if (col %in% names(df)) bits <- c(bits, paste(df[[col]], collapse = "|"))
+    }
+    bits <- c(bits, paste0("nrow=", nrow(df)))
+  }
+  if (!is.null(genes) && length(genes) > 0) {
+    bits <- c(bits, paste(sort(unique(as.character(genes))), collapse = "|"))
+  }
+  if (length(bits) == 0) return(NA_character_)
+  .sha256(bits)
+}
+
+#' What evidence is there that the model actually reasoned?
+#'
+#' Two wire formats put it in two places, and both are checked. The Anthropic format emits a
+#' `thinking` content block; the OpenAI format reports `usage.completion_tokens_details.
+#' reasoning_tokens` and may return `message$reasoning_content`. Returns NA when there is no
+#' response to inspect.
+#'
+#' The distinction matters in practice: on one relay we measured, a `thinking` request is
+#' accepted and silently discarded -- 0 blocks over 11 calls, no change in output length --
+#' while on another an explicit `reasoning_effort` produces a monotone, countable
+#' `reasoning_tokens`. A FALSE here therefore means "no reasoning came back", which is not
+#' the same claim as "the model did not reason": a relay can strip the evidence.
+#' @noRd
+.reasoning_evidence <- function(gen) {
+  if (is.null(gen)) return(NA)
+  tryCatch({
+    # aisdk's GenerateResult exposes `object`, `usage`, `raw_text`, `finish_reason` and no
+    # raw_response, so the provider payload is only reachable through `usage`. An earlier
+    # version of this function read gen$raw_response$... and therefore returned NA on every
+    # call, including calls that did reason -- the field looked implemented and measured
+    # nothing. It is checked here against a live response rather than against the API docs.
+    u <- tryCatch(gen$usage, error = function(e) NULL)
+    if (is.null(u)) return(NA)
+    rt <- u$completion_tokens_details$reasoning_tokens
+    if (!is.null(rt) && is.numeric(rt) && length(rt) == 1L && !is.na(rt)) return(rt > 0)
+    # Anthropic-format responses report thinking as content blocks rather than in usage; where
+    # aisdk surfaces them they appear here, and where it does not this stays NA rather than
+    # asserting that no reasoning occurred.
+    body <- tryCatch(gen$object$content, error = function(e) NULL)
+    if (!is.null(body)) {
+      types <- vapply(body, function(b) as.character(b$type %||% ""), character(1))
+      return(any(types %in% c("thinking", "redacted_thinking", "reasoning")))
+    }
+    NA
+  }, error = function(e) NA)
+}
+
+#' Reasoning tokens the provider reports, where it reports any.
+#' @noRd
+.reasoning_tokens <- function(gen) {
+  if (is.null(gen)) return(NA_integer_)
+  tryCatch({
+    rt <- gen$usage$completion_tokens_details$reasoning_tokens
+    if (is.null(rt) || !is.numeric(rt) || length(rt) != 1L) NA_integer_ else as.integer(rt)
+  }, error = function(e) NA_integer_)
+}
+
+#' @keywords internal
+.prov_new <- function() {
+  e <- new.env(parent = emptyenv())
+  e$calls <- list()
+  e$t_start <- Sys.time()
+  e
+}
+
+#' Record one model call. Never throws: provenance must not be able to break a run.
+#' @noRd
+.prov_record <- function(collector, stage, model, system, prompt, schema_name,
+                         temperature, max_tokens, gen = NULL, t0 = NULL,
+                         error_message = NULL, reasoning = NULL) {
+  if (is.null(collector)) return(invisible(NULL))
+  tryCatch({
+    id <- .model_identity(model)
+    raw <- tryCatch(gen$raw_text, error = function(e) NULL)
+    obj <- tryCatch(gen$object, error = function(e) NULL)
+    fin <- tryCatch(gen$finish_reason, error = function(e) NULL)
+    usage <- tryCatch(gen$usage, error = function(e) NULL)
+    # The model the caller ASKED for and the model that ANSWERED are different facts. Most
+    # of this project's runs went through a relay whose catalogue changed under a stable
+    # interface, so the requested identifier is not evidence of what served the request.
+    # Where the provider echoes a model id in the response body, record it; where it does
+    # not, leave NA rather than copying the request over it.
+    served <- tryCatch(gen$raw_response$model, error = function(e) NULL)
+    if (is.null(served)) served <- tryCatch(gen$raw_response$body$model, error = function(e) NULL)
+    if (!is.character(served) || length(served) != 1L) served <- NA_character_
+    status <- if (!is.null(error_message)) "call_failed" else if (!is.null(obj)) "ok" else "unparsed"
+    # Anthropic-format responses report CACHED prompt tokens separately from `prompt_tokens`, so a
+    # largely cached prompt can report `prompt_tokens = 2` while the model in fact read thousands.
+    # This project's own stamps show exactly that: cleaner calls at 2 against a synthesizer at 505
+    # on the same run. Capture the cache fields wherever the provider emits them, and leave them
+    # NA where it does not -- 0 would assert that no caching occurred, which is a different claim
+    # from not knowing whether it did.
+    .usage_field <- function(nm) {
+      v <- if (is.null(usage)) NULL else usage[[nm]]
+      if (is.null(v)) v <- tryCatch(gen$raw_response$usage[[nm]], error = function(e) NULL)
+      if (is.null(v)) v <- tryCatch(gen$raw_response$body$usage[[nm]], error = function(e) NULL)
+      if (is.null(v) || !is.numeric(v) || length(v) != 1L) NA_integer_ else as.integer(v)
+    }
+    cache_read_tok <- .usage_field("cache_read_input_tokens")
+    cache_creat_tok <- .usage_field("cache_creation_input_tokens")
+    prompt_tok <- usage$prompt_tokens %||% NA_integer_
+    # Effective input = everything the model read, cached or not. NA-safe on purpose: if no
+    # component is reported the total stays NA rather than collapsing to a confident 0.
+    .parts <- c(prompt_tok, cache_read_tok, cache_creat_tok)
+    prompt_tok_eff <- if (all(is.na(.parts))) NA_integer_ else as.integer(sum(.parts, na.rm = TRUE))
+    collector$calls[[length(collector$calls) + 1L]] <- list(
+      stage = stage,
+      status = status,
+      error_message = error_message %||% NA_character_,
+      model_requested = id$model_id,
+      model_served = served,
+      model_matches_request = if (is.na(served)) NA else identical(served, id$model_id),
+      provider = id$provider,
+      endpoint = id$endpoint,
+      schema_name = schema_name,
+      # what was asked for
+      temperature_requested = temperature,
+      max_tokens_requested = max_tokens,
+      # what came back. The absence of an echo of the requested parameters is itself the
+      # finding: aisdk/gateway responses do not report the settings actually applied, so
+      # `*_applied` stays NA and the caller can see that it is unverified rather than assume
+      # the request was honoured.
+      temperature_applied = NA_real_,
+      max_tokens_applied = NA_real_,
+      # Reasoning effort is a decoding parameter like the others and belongs in the stamp for
+      # the same reason: it changes what the model does, and a gateway may accept the request
+      # and drop it. `reasoning_requested` is what we asked for. `reasoning_evidence` is the
+      # only thing a client can observe about what happened -- whether the response actually
+      # carried a reasoning/thinking block. On relays that strip those blocks this stays
+      # FALSE even when reasoning ran, so it is evidence of reasoning, never proof of its
+      # absence, and it is named to say so.
+      reasoning_requested = if (is.null(reasoning)) NA_character_
+                            else paste(utils::capture.output(str(reasoning)), collapse = " "),
+      reasoning_evidence = .reasoning_evidence(gen),
+      reasoning_tokens = .reasoning_tokens(gen),
+      finish_reason = fin %||% NA_character_,
+      response_chars = if (is.null(raw)) NA_integer_ else nchar(raw),
+      prompt_tokens = prompt_tok,
+      cache_read_tokens = cache_read_tok,
+      cache_creation_tokens = cache_creat_tok,
+      prompt_tokens_effective = prompt_tok_eff,
+      completion_tokens = usage$completion_tokens %||% NA_integer_,
+      total_tokens = usage$total_tokens %||% NA_integer_,
+      system_sha256 = .sha256(system),
+      prompt_sha256 = .sha256(prompt),
+      response_sha256 = .sha256(raw),
+      runtime_sec = if (is.null(t0)) NA_real_ else
+        round(as.numeric(difftime(Sys.time(), t0, units = "secs")), 2),
+      timestamp_utc = format(Sys.time(), "%Y-%m-%dT%H:%M:%SZ", tz = "UTC")
+    )
+  }, error = function(e) invisible(NULL))
+  invisible(NULL)
+}
+
+#' @keywords internal
+.pkg_ver <- function(p) tryCatch(as.character(utils::packageVersion(p)),
+                                 error = function(e) NA_character_)
+
+#' @keywords internal
+.prov_finalize <- function(collector, entry_point, evidence_sha256 = NA_character_,
+                           extra = list()) {
+  if (is.null(collector)) return(NULL)
+  calls <- collector$calls
+  st <- vapply(calls, function(c) c$status, character(1))
+  prov <- c(list(
+    entry_point = entry_point,
+    ok = length(st) > 0 && all(st == "ok"),
+    n_calls = length(calls),
+    n_calls_failed = sum(st != "ok"),
+    evidence_sha256 = evidence_sha256,
+    started_utc = format(collector$t_start, "%Y-%m-%dT%H:%M:%SZ", tz = "UTC"),
+    runtime_sec = round(as.numeric(difftime(Sys.time(), collector$t_start, units = "secs")), 2),
+    software = list(
+      r = paste0(R.version$major, ".", R.version$minor),
+      clusterProfiler = .pkg_ver("clusterProfiler"),
+      aisdk = .pkg_ver("aisdk"),
+      DOSE = .pkg_ver("DOSE"),
+      GOSemSim = .pkg_ver("GOSemSim")
+    ),
+    calls = calls
+  ), extra)
+  class(prov) <- c("interpret_provenance", "list")
+  prov
+}
+
+# Upper-case words and abbreviations that are also official gene symbols but, in an
+# interpretation, are almost never used as genes.
+.evidence_stop <- c("SET", "MAX", "CAT", "REST", "IMPACT", "CAMP", "MET", "ACE", "CLOCK", "SHE",
+                    "NOT", "AND", "FOR", "GO", "BP", "CC", "MF", "DNA", "RNA", "ATP", "PPI", "TF")
+
+#' Evidence status of every gene named in an interpretation
+#'
+#' Deterministically classifies each gene symbol that an interpretation names as
+#' `observed` (a member gene of the enrichment result it was given) or `out_of_evidence`
+#' (a valid symbol that is not). No model is called. Use it to label hypotheses from
+#' [interpret_agent()] as inferred rather than observed: unlike a second model, this check
+#' is exact and cannot also mark grounded genes as uncertain.
+#'
+#' @param x An `interpretation` or `interpretation_list` returned by [interpret()],
+#'   [interpret_agent()] or [interpret_hierarchical()].
+#' @param enrichment The `enrichResult`, `compareClusterResult`, `gseaResult` or data.frame
+#'   the interpretation was produced from (readable, so that member genes are symbols).
+#' @param OrgDb Optional `OrgDb` used to recognise out-of-evidence symbols. Without it, only
+#'   tokens that look like gene symbols and appear in `symbols` are considered.
+#' @param symbols Optional character vector of valid gene symbols (alternative to `OrgDb`).
+#' @param fields Record fields to scan.
+#' @return A data.frame with columns `cluster`, `field`, `gene` and `status`.
+#' @md
+#' @export
+evidence_status <- function(x, enrichment, OrgDb = NULL, symbols = NULL,
+                            fields = c("overview", "key_mechanisms", "regulatory_drivers", "crosstalk",
+                                       "hypothesis", "narrative", "reasoning", "network_evidence")) {
+  df <- if (is.data.frame(enrichment)) enrichment else as.data.frame(enrichment)
+  gcol <- intersect(c("geneID", "core_enrichment"), names(df))[1]
+  if (is.na(gcol)) rlang::abort("`enrichment` has no geneID or core_enrichment column.")
+  ev_of <- function(d) unique(toupper(unlist(strsplit(as.character(d[[gcol]]), "/"))))
+  if (is.null(symbols) && !is.null(OrgDb)) {
+    symbols <- AnnotationDbi::keys(OrgDb, keytype = "SYMBOL")
+  }
+  vocab <- if (is.null(symbols)) NULL else toupper(symbols)
+  recs <- if (inherits(x, "interpretation_list")) unclass(x) else list(Default = x)
+  out <- lapply(names(recs), function(cl) {
+    r <- recs[[cl]]
+    d <- if ("Cluster" %in% names(df) && cl %in% df$Cluster) df[df$Cluster == cl, , drop = FALSE] else df
+    ev <- ev_of(d)
+    rows <- lapply(intersect(fields, names(r)), function(f) {
+      txt <- paste(unlist(r[[f]]), collapse = " ")
+      # Human-style symbols are written in capitals; accept those against the evidence or the
+      # vocabulary. Mouse-style Title-case tokens are accepted only when they are evidence genes,
+      # so ordinary capitalised words are never counted.
+      caps <- unique(unlist(regmatches(txt, gregexpr("\\b[A-Z][A-Z0-9-]{1,11}\\b", txt))))
+      # "AURKB-BIRC5" names two genes; keep the hyphenated form (HLA-DRA, NKX2-1) and its parts
+      caps <- unique(c(caps, unlist(strsplit(caps[grepl("-", caps)], "-"))))
+      caps <- setdiff(caps, .evidence_stop)
+      title <- unique(toupper(unlist(regmatches(txt, gregexpr("\\b[A-Z][a-z0-9]{1,9}\\b", txt)))))
+      tok <- unique(c(caps[caps %in% ev | (!is.null(vocab) & caps %in% vocab)], title[title %in% ev]))
+      if (!length(tok)) return(NULL)
+      data.frame(cluster = cl, field = f, gene = tok,
+                 status = ifelse(tok %in% ev, "observed", "out_of_evidence"), stringsAsFactors = FALSE)
+    })
+    do.call(rbind, rows)
+  })
+  res <- do.call(rbind, out)
+  if (is.null(res)) res <- data.frame(cluster = character(), field = character(), gene = character(), status = character())
+  rownames(res) <- NULL
+  res
+}
+
+#' Execution provenance of an interpretation
+#'
+#' Returns the execution record attached to a result of [interpret()],
+#' [interpret_agent()] or [interpret_hierarchical()]: the model actually addressed, the
+#' decoding parameters requested (and whether the response confirmed them), SHA-256 digests
+#' of the system prompt, user prompt, raw response and input evidence, token usage,
+#' `finish_reason`, per-call status and package versions.
+#'
+#' A remote model is not a versionable dependency. Without this record an interpretation
+#' cannot be reproduced, and a call that failed at the transport layer is indistinguishable
+#' from a model that had nothing to say -- both arrive as an ordinary result object. Check
+#' `provenance(x)$ok` before treating any interpretation as data.
+#'
+#' @param x An `interpretation`, `interpretation_list` or agent result.
+#' @return An `interpret_provenance` list, or `NULL` if the object carries no stamp.
+#' @md
+#' @export
+provenance <- function(x) {
+  p <- attr(x, "provenance")
+  if (!is.null(p)) return(p)
+  if (is.list(x) && !is.null(x$provenance)) return(x$provenance)
+  NULL
+}
+
+#' @export
+print.interpret_provenance <- function(x, ...) {
+  cat("<interpret provenance>\n")
+  cat(sprintf("  entry point : %s\n", x$entry_point))
+  cat(sprintf("  status      : %s (%d call%s, %d failed)\n",
+              if (isTRUE(x$ok)) "ok" else "INCOMPLETE",
+              x$n_calls, if (x$n_calls == 1) "" else "s", x$n_calls_failed))
+  cat(sprintf("  started     : %s  (%.1fs)\n", x$started_utc, x$runtime_sec))
+  cat(sprintf("  evidence    : sha256 %s\n", substr(x$evidence_sha256, 1, 16)))
+  for (c in x$calls) {
+    served <- if (is.na(c$model_served)) "not reported" else
+      if (isTRUE(c$model_matches_request)) "as requested" else paste0("SERVED ", c$model_served)
+    cat(sprintf("  - %-11s %-10s req=%s%s (%s)  T=%s max_tokens=%s  finish=%s  %sc  %.1fs\n",
+                c$stage, c$status,
+                if (is.na(c$provider)) "" else paste0(c$provider, ":"),
+                c$model_requested, served,
+                format(c$temperature_requested), format(c$max_tokens_requested),
+                c$finish_reason, format(c$response_chars), c$runtime_sec))
+    if (!is.na(c$error_message)) cat(sprintf("      error: %s\n", c$error_message))
+  }
+  cat(sprintf("  software    : R %s / clusterProfiler %s / aisdk %s\n",
+              x$software$r, x$software$clusterProfiler, x$software$aisdk))
+  cat("  note        : *_applied are NA because the response does not echo the settings\n")
+  cat("                actually used; requested != verified. A model id shown as\n")
+  cat("                'not reported' means the provider returned none -- the requested\n")
+  cat("                identifier is then a request, not a record of what answered.\n")
+  invisible(x)
+}
+
+#' Digest of the whole evidence set handed to one entry-point call.
+#' @noRd
+.evidence_digest_all <- function(x, res_list) {
+  bits <- character(0)
+  for (nm in names(res_list)) {
+    it <- res_list[[nm]]
+    d <- .evidence_digest(x, it$df, it$genes)
+    bits <- c(bits, paste0(nm, "=", if (is.na(d)) "" else d))
+  }
+  if (length(bits) == 0) return(NA_character_)
+  .sha256(bits)
+}
+
+#' @keywords internal
+.attach_provenance <- function(obj, prov) {
+  if (is.null(prov)) return(obj)
+  attr(obj, "provenance") <- prov
+  obj
+}
+
+#' @keywords internal
+.gen_object_stamped <- function(collector, stage, model, prompt, schema, schema_name,
+                                system, temperature, max_tokens, reasoning = NULL) {
+  t0 <- Sys.time()
+  # Capture through the tryCatch return value rather than by assignment from inside it.
+  # `gen <<- ...` here would be a bug: `<<-` starts its search in the PARENT environment, so
+  # it skips the local binding, silently creates a global, and leaves this function returning
+  # NULL on every call -- which reaches the caller as a model that produced nothing.
+  cap <- tryCatch(
+    list(gen = do.call(generate_object, c(
+           list(model = model, prompt = prompt, schema = schema,
+                schema_name = schema_name, system = system,
+                temperature = temperature, max_tokens = max_tokens),
+           # Passed through only when the caller asked for it, so a run that does not set
+           # `reasoning` sends exactly the request shape it sent before this argument existed.
+           if (is.null(reasoning)) list() else list(reasoning = reasoning))),
+         err = NULL),
+    error = function(e) list(gen = NULL, err = conditionMessage(e))
+  )
+  gen <- cap$gen
+  err <- cap$err
+  .prov_record(collector, stage, model, system, prompt, schema_name,
+               temperature, max_tokens, gen = gen, t0 = t0, error_message = err,
+               reasoning = reasoning)
+  # Re-raise so each call site keeps the error handling it already had; the stamp is
+  # recorded first, so a failed call is still visible in provenance().
+  if (!is.null(err)) stop(err, call. = FALSE)
+  gen
+}
+
 .call_generate_object <- function(model, task, cluster_id, user_prompt,
                                   has_prior = FALSE, max_tokens = 8192,
-                                  temperature = 0.3) {
+                                  temperature = 0.3, collector = NULL,
+                                  stage = "interpret", reasoning = NULL) {
   if (task %in% c("annotation", "cell_type")) {
     sys <- .annotation_system_prompt(cluster_id, has_prior)
     schema <- if (has_prior) .annotation_refinement_schema() else .annotation_schema()
@@ -1024,16 +1710,29 @@ interpret_hierarchical <- function(x_minor,
 
   debug <- isTRUE(getOption("aisdk.debug", FALSE))
 
+  # `model` may be a character id OR an aisdk LanguageModelV1, which is an ENVIRONMENT. Pasting an
+  # environment into a message raises "cannot coerce type 'environment' to vector of type
+  # 'character'". Every place this function names the model in human-readable text must therefore
+  # go through .model_identity(), never through `model` directly. The two sites in the FAILURE
+  # branches below are the ones that mattered: they turned every failed call into a bogus
+  # input-contract error and destroyed the real diagnosis with it.
+  model_label <- {
+    id <- tryCatch(.model_identity(model)$model_id, error = function(e) NA_character_)
+    if (is.null(id) || is.na(id)) "<unnamed model object>" else id
+  }
+
   if (debug) {
     message(
-      "[DEBUG] .call_generate_object: model=", model,
+      "[DEBUG] .call_generate_object: model=", model_label,
       " task=", task, " cluster=", cluster_id, " max_tokens=", max_tokens
     )
   }
 
   result <- tryCatch(
     {
-      gen <- generate_object(
+      gen <- .gen_object_stamped(
+        reasoning = reasoning,
+        collector = collector, stage = stage,
         model = model, prompt = user_prompt, schema = schema,
         schema_name = schema_name, system = sys,
         temperature = temperature, max_tokens = max_tokens
@@ -1073,7 +1772,7 @@ interpret_hierarchical <- function(x_minor,
 
         warn_parts <- c(
           paste0("generate_object() returned NULL for cluster '", cluster_id, "'."),
-          "i" = paste0("Model: ", model),
+          "i" = paste0("Model: ", model_label),
           "i" = paste0("finish_reason: ", finish),
           "i" = paste0(
             "raw_text (", nchar(raw), " chars): ",
@@ -1097,7 +1796,7 @@ interpret_hierarchical <- function(x_minor,
     error = function(e) {
       rlang::warn(c(
         paste0("LLM call failed for cluster '", cluster_id, "': ", e$message),
-        "i" = paste0("Model: ", model),
+        "i" = paste0("Model: ", model_label),
         "i" = "Tip: Re-run with verbose=TRUE for full debug output"
       ))
       res <- list(
@@ -1135,7 +1834,33 @@ interpret_hierarchical <- function(x_minor,
   )
 }
 
+#' Raise when a model call returned successfully but produced no parsable object.
+#'
+#' `generate_object()` signals nothing when the transport succeeds and the body fails to
+#' validate against the schema: it returns normally with `object = NULL` and the raw text
+#' intact. Every agent in `interpret_agent()` therefore has to decide for itself whether a
+#' missing object is "this agent had nothing to add" or "this call failed", and until
+#' 2026-08-27 all four treated it as the former. `finish_reason` is carried into the message
+#' because it is the one field that distinguishes a truncated response from a well-formed
+#' answer the schema rejected.
+#' @noRd
+.stop_if_unparsed <- function(gen, agent) {
+  if (!is.null(gen) && !is.null(gen$object)) return(invisible(TRUE))
+  fr <- tryCatch(gen$finish_reason, error = function(e) NULL) %||% "NA"
+  n  <- tryCatch(nchar(gen$raw_text %||% ""), error = function(e) 0L)
+  stop(sprintf("Agent %s returned no parsable object (finish_reason=%s, raw_text=%d chars)",
+               agent, fr, n), call. = FALSE)
+}
+
 .postprocess_network <- function(res) {
+  # Defence in depth for the failure above. `class(res) <- ...` on NULL raises "attempt to set
+  # an attribute on NULL" and aborts the entire run, so a cluster whose synthesizer produced
+  # nothing took the whole call down with it instead of being reported as an empty result.
+  # Every caller of this function is at the end of a pipeline that may legitimately have
+  # produced nothing; none of them should have to crash to say so.
+  if (is.null(res)) {
+    res <- list(overview = "No interpretation was produced for this unit.", confidence = "None")
+  }
   if (!is.list(res) || is.null(res$refined_network)) {
     class(res) <- union("interpretation", class(res))
     return(res)
@@ -1314,3 +2039,151 @@ print.interpretation_list <- function(x, ...) {
   }
   invisible(x)
 }
+
+# ============================================================================
+# rrvgo Integration: Optional GO Term Redundancy Reduction
+# ============================================================================
+
+#' Reduce GO term redundancy by semantic similarity
+#'
+#' Applies semantic similarity-based clustering to remove redundant GO terms
+#' before LLM interpretation. This algorithmic preprocessing complements the
+#' multi-agent interpretation layer by reducing input noise and token count.
+#'
+#' Implemented directly on GOSemSim, which is already an Imports dependency.
+#' The `rrvgo_*` attribute names are kept for backwards compatibility with
+#' existing ablation outputs and predate the switch away from rrvgo.
+#'
+#' @param enrich_result An enrichResult object from enrichGO()
+#' @param threshold Semantic similarity threshold (0-1). Higher values are more
+#'   aggressive. Default 0.7 means terms with >70% similarity are clustered.
+#' @param orgdb OrgDb package name (e.g., "org.Hs.eg.db"). If NULL, auto-detected
+#'   from the enrichResult organism field.
+#' @param method Similarity measure passed to [GOSemSim::goSim()]. Default "Wang",
+#'   which reads the GO DAG directly and needs no corpus statistics. The
+#'   information-content measures "Resnik", "Lin", "Rel" and "Jiang" are accepted
+#'   but require `godata(computeIC = TRUE)` and are substantially slower.
+#' @return A reduced enrichResult object with redundant terms removed. The object
+#'   carries attributes recording the reduction: `rrvgo_reduced`, `rrvgo_original_n`,
+#'   `rrvgo_reduced_n`, `rrvgo_threshold`, `rrvgo_method`.
+#' @md
+#' @export
+#' @examples
+#' \dontrun{
+#' ego <- enrichGO(gene = genes, OrgDb = org.Mm.eg.db, ont = "BP")
+#' ego_reduced <- reduce_go_redundancy(ego, threshold = 0.7)
+#' message(sprintf("Reduced from %d to %d terms",
+#'   attr(ego_reduced, "rrvgo_original_n"),
+#'   attr(ego_reduced, "rrvgo_reduced_n")))
+#' }
+reduce_go_redundancy <- function(enrich_result,
+                                 threshold = 0.7,
+                                 orgdb = NULL,
+                                 method = "Wang") {
+  # Semantic-similarity redundancy reduction over an enrichGO result.
+  #
+  # Implemented directly on GOSemSim rather than on rrvgo. rrvgo is the obvious dependency
+  # and we tried it first, but installing it on the execution node failed: its chain runs
+  # rrvgo -> umap -> reticulate, and the node cannot complete it. GOSemSim -- which rrvgo
+  # itself sits on -- is already present, and supplies everything this step needs.
+  #
+  # `method` defaults to Wang deliberately. The information-content measures (Rel, Resnik,
+  # Lin, Jiang) require `godata(computeIC = TRUE)`, which on this dataset did not complete;
+  # Wang is graph-based, reads the GO DAG directly, needs no corpus statistics, and returns
+  # in seconds. Passing an IC-based measure here is allowed but will be slow or hang, and
+  # `computeIC` is set from `method` accordingly.
+  if (!is(enrich_result, "enrichResult")) {
+    message("Input is not an enrichResult object; skipping GO reduction.")
+    return(enrich_result)
+  }
+  ontology <- tryCatch(enrich_result@ontology, error = function(e) NULL)
+  if (is.null(ontology) || !ontology %in% c("BP", "MF", "CC")) {
+    warning("Not a GO enrichment result; skipping GO reduction.")
+    return(enrich_result)
+  }
+  if (!requireNamespace("GOSemSim", quietly = TRUE)) {
+    warning("GOSemSim not installed; skipping GO reduction and returning the input unchanged.")
+    return(enrich_result)
+  }
+  if (is.null(enrich_result@result) || nrow(enrich_result@result) == 0) {
+    warning("Empty enrichment result; skipping GO reduction.")
+    return(enrich_result)
+  }
+
+  # Reduce only the terms that pass the object's own cutoffs -- the ones a reader (and
+  # interpret()) actually sees. An enrichResult keeps every tested term in @result; running
+  # the O(n^2) similarity over thousands of non-significant rows was slow and pointless.
+  # Rows that do not pass the cutoffs are left in @result unchanged.
+  sig_ids <- tryCatch(as.data.frame(enrich_result)$ID, error = function(e) enrich_result@result$ID)
+  if (length(sig_ids) == 0) {
+    warning("No term passes the result's cutoffs; skipping GO reduction.")
+    return(enrich_result)
+  }
+  sig_rows <- match(sig_ids, enrich_result@result$ID)
+  n_original <- length(sig_ids)
+  go_ids <- sig_ids
+
+  if (is.null(orgdb)) {
+    organism <- tryCatch(enrich_result@organism, error = function(e) "")
+    orgdb <- if (grepl("sapiens|human|^hsa$", organism, ignore.case = TRUE)) {
+      "org.Hs.eg.db"
+    } else if (grepl("musculus|mouse|^mmu$", organism, ignore.case = TRUE)) {
+      "org.Mm.eg.db"
+    } else {
+      warning(sprintf("Cannot map organism '%s' to an OrgDb; skipping GO reduction.", organism))
+      return(enrich_result)
+    }
+  }
+  if (!requireNamespace(orgdb, quietly = TRUE)) {
+    warning(sprintf("%s not installed; skipping GO reduction.", orgdb))
+    return(enrich_result)
+  }
+
+  message(sprintf("Reducing GO redundancy: %d terms, %s similarity, threshold %.2f",
+                  n_original, method, threshold))
+
+  out <- tryCatch({
+    need_ic <- !identical(method, "Wang")
+    semdata <- GOSemSim::godata(orgdb, ont = ontology, computeIC = need_ic)
+
+    # Pairwise similarity in one vectorised call (termSim), instead of one goSim() call per
+    # pair. Terms GOSemSim cannot score get similarity 0, i.e. they are never merged.
+    n <- length(go_ids)
+    sim <- GOSemSim::termSim(go_ids, go_ids, semData = semdata, method = method)
+    sim <- sim[go_ids, go_ids, drop = FALSE]
+    sim[is.na(sim)] <- 0
+    diag(sim) <- 1
+
+    # Greedy representative selection: repeatedly take the most significant remaining term
+    # and drop everything above `threshold` similarity to it. The representative is chosen
+    # by adjusted p-value, so the surviving list is the significant one, not an arbitrary
+    # member of each cluster.
+    padj <- enrich_result@result$p.adjust[sig_rows]
+    keep <- integer(0)
+    remaining <- seq_len(n)
+    while (length(remaining) > 0) {
+      best <- remaining[which.min(padj[remaining])]
+      keep <- c(keep, best)
+      remaining <- remaining[!(sim[best, remaining] > threshold)]
+    }
+    drop_rows <- sig_rows[setdiff(seq_len(n), keep)]
+
+    reduced <- enrich_result
+    reduced@result <- if (length(drop_rows)) enrich_result@result[-drop_rows, , drop = FALSE] else enrich_result@result
+    n_reduced <- length(keep)
+    message(sprintf("GO reduction complete: %d -> %d terms (%.1f%% reduction)",
+                    n_original, n_reduced, 100 * (n_original - n_reduced) / n_original))
+
+    attr(reduced, "rrvgo_reduced") <- TRUE
+    attr(reduced, "rrvgo_original_n") <- n_original
+    attr(reduced, "rrvgo_reduced_n") <- n_reduced
+    attr(reduced, "rrvgo_threshold") <- threshold
+    attr(reduced, "rrvgo_method") <- method
+    reduced
+  }, error = function(e) {
+    warning(sprintf("GO reduction failed (%s); returning the input unchanged.", e$message))
+    enrich_result
+  })
+  out
+}
+

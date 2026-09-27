@@ -15,6 +15,9 @@ interpret(
   gene_fold_change = NULL,
   max_tokens = 8192,
   temperature = 0.3,
+  reduce_go = FALSE,
+  go_reduction_threshold = 0.7,
+  reasoning = NULL,
   verbose = FALSE
 )
 }
@@ -48,6 +51,19 @@ Some models (especially reasoning models) may need much higher values
 (e.g., 16384 or more) to produce complete structured output.}
 
 \item{temperature}{Sampling temperature. Default 0.3.}
+
+\item{reduce_go}{Logical, whether to apply semantic-similarity GO term redundancy
+reduction before interpretation. Only applies to GO enrichment results.
+Default FALSE.}
+
+\item{go_reduction_threshold}{Semantic similarity threshold (0-1).
+Higher values = more aggressive reduction. Default 0.7.}
+
+\item{reasoning}{Optional reasoning/thinking configuration passed through to the
+provider, e.g. \code{list(type = "enabled", budget_tokens = 4096)}. Left \code{NULL}
+the request is byte-identical to one made before this argument existed. Whatever is
+passed is recorded in the execution stamp as \code{reasoning_requested}, alongside
+\code{reasoning_evidence} -- whether the response actually carried a reasoning block.}
 
 \item{verbose}{Logical, whether to print debug messages showing raw API
 responses, token usage, and JSON parsing details. Default FALSE.
@@ -89,6 +105,9 @@ res <- interpret(df,
   model = "deepseek:deepseek-chat",
   context = "Cancer proliferation study"
 )
+# With GO redundancy reduction
+ego <- enrichGO(gene = genes, OrgDb = org.Mm.eg.db, ont = "BP")
+res <- interpret(ego, reduce_go = TRUE, go_reduction_threshold = 0.7)
 # Reuse aisdk's global default model
 # aisdk::set_model("openai:gpt-4o-mini")
 # res <- interpret(df, context = "Cancer proliferation study")
