@@ -457,8 +457,13 @@ process_enrichment_input <- function(x, n_pathways) {
 #' Uses `generate_object()` internally for reliable structured output with
 #' automatic JSON repair, eliminating manual parsing failures.
 #'
+#' `interpret()` is an S4 generic: the method documented here (`ANY`) handles enrichment
+#' results, and other packages add methods for their own classes.
+#'
 #' @param x An enrichment result object (`enrichResult`, `gseaResult`,
 #'   `compareClusterResult`, or a `data.frame` with pathway columns).
+#' @param ... Arguments of the method for the class of `x`; for enrichment results, the
+#'   ones below.
 #' @param context A string describing the experimental background
 #'   (e.g., "scRNA-seq of mouse myocardial infarction at day 3").
 #' @param n_pathways Maximum number of terms (per cluster) sent to the model, taken in order
@@ -516,7 +521,8 @@ process_enrichment_input <- function(x, n_pathways) {
 #'   crosstalk, hypothesis, narrative, refined_network and network_evidence; with `prior`,
 #'   also `conclusion`, `prior_verdict` and `prior_rationale`.
 #' @md
-#' @export
+#' @rdname interpret
+#' @exportMethod interpret
 #' @examples
 #' \dontrun{
 #' # Basic usage with a data frame
@@ -541,7 +547,7 @@ process_enrichment_input <- function(x, n_pathways) {
 #' # res <- interpret(df, context = "Cancer proliferation study")
 #' print(res)
 #' }
-interpret <- function(x,
+setMethod("interpret", "ANY", function(x,
                       context = NULL,
                       n_pathways = NULL,
                       model = NULL,
@@ -566,7 +572,7 @@ interpret <- function(x,
     reasoning = reasoning, verbose = verbose, reduce_go = reduce_go,
     go_reduction_threshold = go_reduction_threshold
   )
-}
+})
 
 # One structured call per unit. `task = "cell_type"` is kept internal for interpret_hierarchical(),
 # whose Major -> Minor constraint needs a cell-type label at the major level; interpret() itself
@@ -809,7 +815,12 @@ interpret <- function(x,
 #'
 #' Uses aisdk's Agent and Session system for shared context across agents.
 #'
+#' `interpret_agent()` is an S4 generic: the method documented here (`ANY`) handles
+#' enrichment results, and other packages add methods for their own classes.
+#'
 #' @param x An enrichment result object.
+#' @param ... Arguments of the method for the class of `x`; for enrichment results, the
+#'   ones below.
 #' @param context A string describing the experimental background. State the question the
 #'   analysis should answer here (for example "which cell type is this cluster?"); the answer
 #'   is returned as `conclusion`.
@@ -873,7 +884,8 @@ interpret <- function(x,
 #'   evidence can single out, with `supported_resolution` giving the claim the
 #'   evidence does support.
 #' @md
-#' @export
+#' @rdname interpret_agent
+#' @exportMethod interpret_agent
 #' @examples
 #' \dontrun{
 #' res <- interpret_agent(df,
@@ -888,7 +900,7 @@ interpret <- function(x,
 #' )
 #' res$conclusion; res$prior_verdict
 #' }
-interpret_agent <- function(x,
+setMethod("interpret_agent", "ANY", function(x,
                             context = NULL,
                             prior = NULL,
                             n_pathways = NULL,
@@ -1223,7 +1235,7 @@ interpret_agent <- function(x,
   }
   class(results) <- c("interpretation_list", "list")
   .attach_provenance(results, .p)
-}
+})
 
 # ============================================================================
 # Core: interpret_hierarchical()

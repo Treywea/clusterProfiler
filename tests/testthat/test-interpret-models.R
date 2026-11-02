@@ -72,7 +72,7 @@ test_that("interpret normalizes bare model IDs before dispatch", {
 })
 
 test_that("interpret wrappers default to aisdk global model via model = NULL", {
-  expect_null(formals(clusterProfiler::interpret)$model)
-  expect_null(formals(clusterProfiler::interpret_agent)$model)
+  expect_null(method_formals("interpret")$model)
+  expect_null(method_formals("interpret_agent")$model)
   expect_null(formals(clusterProfiler::interpret_hierarchical)$model)
 })

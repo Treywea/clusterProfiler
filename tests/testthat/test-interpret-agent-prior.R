@@ -32,15 +32,15 @@ mock_agent_calls <- function(env) {
 }
 
 test_that("interpret() takes prior but not task, and sends every reduced term by default", {
-  f <- formals(clusterProfiler::interpret)
+  f <- method_formals("interpret")
   expect_false("task" %in% names(f))
   expect_true("prior" %in% names(f))
   expect_null(f$prior)
   expect_null(f$n_pathways)
   expect_false("task" %in% names(formals(clusterProfiler::interpret_hierarchical)))
   expect_null(formals(clusterProfiler::interpret_hierarchical)$n_pathways)
-  expect_true("prior" %in% names(formals(clusterProfiler::interpret_agent)))
-  expect_null(formals(clusterProfiler::interpret_agent)$n_pathways)
+  expect_true("prior" %in% names(method_formals("interpret_agent")))
+  expect_null(method_formals("interpret_agent")$n_pathways)
   expect_error(clusterProfiler::interpret(agent_input(), task = "cell_type"), "unused argument")
 })
 

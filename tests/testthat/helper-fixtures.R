@@ -40,3 +40,10 @@ use_fixture_cache <- function(env = parent.frame()) {
     withr::defer(options(old), envir = env)
     dir
 }
+
+## interpret() and interpret_agent() are S4 generics with formals (x, ...); their
+## arguments are those of the ANY method, which S4 keeps in an inner .local().
+method_formals <- function(f) {
+    m <- methods::getMethod(f, "ANY", where = asNamespace("clusterProfiler"))
+    formals(methods::unRematchDefinition(m))
+}
