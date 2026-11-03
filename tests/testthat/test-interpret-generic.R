@@ -41,6 +41,9 @@ test_that("a method another package adds for its class is used for that class on
 
   expect_equal(clusterProfiler::interpret(methods::new("cpToyRegions", n = 1), assay = "ATAC"),
                "regions ATAC")
+  ## an unsupported input names its class and the classes that do have a method
+  expect_error(clusterProfiler::interpret(1:3), "Unsupported input type `integer`")
+  expect_error(clusterProfiler::interpret(1:3), "also interpret: cpToyRegions")
 
   local_mocked_bindings(
     .interpret_run = function(x, ...) class(x)[1],

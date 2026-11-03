@@ -187,6 +187,16 @@ infer_model_id <- function(model) {
 }
 
 #' @keywords internal
+## Classes other loaded packages have added interpret() methods for, named in the error for an
+## unsupported input so that a caller can see what to convert it to.
+.interpret_other_classes <- function() {
+  sig <- tryCatch(unique(as.vector(methods::findMethodSignatures(interpret))),
+                  error = function(e) character(0))
+  sig <- setdiff(sig, "ANY")
+  if (!length(sig)) return(character(0))
+  c(i = paste0("Loaded packages also interpret: ", paste(sort(sig), collapse = ", "), "."))
+}
+
 .normalize_interpret_model <- function(model = NULL) {
   if (is.null(model) || inherits(model, "LanguageModelV1")) {
     return(model)
@@ -207,7 +217,11 @@ process_enrichment_input <- function(x, n_pathways) {
     } else if (is.data.frame(obj)) {
       return(obj)
     }
-    rlang::abort("Unsupported input type. Expected enrichResult, compareClusterResult, gseaResult, or data.frame.")
+    rlang::abort(c(
+      paste0("Unsupported input type `", class(obj)[1],
+             "`. Expected enrichResult, compareClusterResult, gseaResult, or data.frame."),
+      .interpret_other_classes()
+    ))
   }
 
   get_top_n <- function(df, n) {
